@@ -32,11 +32,21 @@
 #include <ogc/machine/processor.h>
 #include <wiiuse/wpad.h>
 
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
 #include "devicemounter.h"
 
 #define EXECUTE_ADDR	((u8 *) 0x92000000)
 #define BOOTER_ADDR		((u8 *) 0x93000000)
 #define ARGS_ADDR		((u8 *) 0x93200000)
+
+#define MAX_CMDLINE 4096
+#define MAX_ARGV    1000
+struct __argv args;
+char *a_argv[MAX_ARGV];
+char *meta_buf = NULL;
 
 typedef void (*entrypoint) (void);
 extern void __exception_setreload(int t);
@@ -76,6 +86,156 @@ void SystemMenu()
 	SYS_ResetSystem(SYS_RETURNTOMENU, 0, 0);
 }
 
+bool IsDollZ(u8 *buff)
+{
+	int ret;
+
+	u8 dollz_stamp[] = {0x3C};
+	int dollz_offs = 0x100;
+
+	ret = memcmp(&buff[dollz_offs], dollz_stamp, sizeof(dollz_stamp));
+	if (ret == 0)
+		return true;
+
+	return false;
+}
+
+void arg_init()
+{
+	memset(&args, 0, sizeof(args));
+	memset(a_argv, 0, sizeof(a_argv));
+	args.argvMagic = ARGV_MAGIC;
+	args.length = 1; // double \0\0
+	args.argc = 0;
+	//! Put the argument into mem2 too, to avoid overwriting it
+	args.commandLine = (char *) ARGS_ADDR + sizeof(args);
+	args.argv = a_argv;
+	args.endARGV = a_argv;
+}
+
+char* strcopy(char *dest, const char *src, int size)
+{
+	strncpy(dest,src,size);
+	dest[size-1] = 0;
+	return dest;
+}
+
+int arg_addl(char *arg, int len)
+{
+	if (args.argc >= MAX_ARGV) 
+		return -1;
+	if (args.length + len + 1 > MAX_CMDLINE) 
+		return -1;
+	strcopy(args.commandLine + args.length - 1, arg, len+1);
+	args.length += len + 1; // 0 term.
+	args.commandLine[args.length - 1] = 0; // double \0\0
+	args.argc++;
+	args.endARGV = args.argv + args.argc;
+	return 0;
+}
+
+int arg_add(char *arg)
+{
+	return arg_addl(arg, strlen(arg));
+}
+
+int load_file(char *name, void *buf, int size)
+{
+	int fd;
+	int ret;
+	fd = open(name, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	ret = read(fd, buf, size);
+	close(fd);
+	if (ret != size)
+		return -2;
+	return 0;
+}
+
+void load_meta(const char *exe_path)
+{
+	char meta_path[200];
+	const char *p;
+	struct stat st;
+
+	p = strrchr(exe_path, '/');
+	snprintf(meta_path, sizeof(meta_path), "%.*smeta.xml", p ? p-exe_path+1 : 0, exe_path);
+
+	if (stat(meta_path, &st) != 0)
+		return;
+	if (st.st_size > 64*1024)
+		return;
+
+	// +1 so that the buf is 0 terminated
+	meta_buf = calloc(st.st_size + 1, 1);
+	if (!meta_buf)
+		return;
+
+	load_file(meta_path, meta_buf, st.st_size);
+}
+
+void strip_comments(char *buf)
+{
+	char *p = buf; // start of comment
+	char *e; // end of comment
+	int len;
+	while (p && *p) 
+	{
+		p = strstr(p, "<!--");
+		if (!p) 
+			break;
+		e = strstr(p, "-->");
+		if (!e) 
+		{
+			*p = 0; // terminate
+			break;
+		}
+		e += 3;
+		len = strlen(e);
+		memmove(p, e, len + 1); // +1 for 0 termination
+	}
+}
+
+void parse_meta()
+{
+	char *p;
+	char *e, *end;
+	if (meta_buf == NULL) 
+		return;
+	strip_comments(meta_buf);
+	if (!strstr(meta_buf, "<app") || !strstr(meta_buf, "</app>"))
+		return;
+
+	p = strstr(meta_buf, "<arguments>");
+	if (!p) 
+		return;
+
+	end = strstr(meta_buf, "</arguments>");
+	if (!end) 
+		return;
+
+	do 
+	{
+		p = strstr(p, "<arg>");
+		if (!p) 
+			return;
+		p += 5; //strlen("<arg>");
+		e = strstr(p, "</arg>");
+		if (!e) 
+			return;
+		arg_addl(p, e-p);
+		p = e + 6;
+	} 
+	while (p < end);
+
+	if (meta_buf)
+	{ 
+		free(meta_buf); 
+		meta_buf = NULL; 
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	u32 cookie;
@@ -89,11 +249,11 @@ int main(int argc, char *argv[])
 	void *xfb = NULL;
 	GXRModeObj *rmode = NULL;
 
-	VIDEO_Init();
+	VIDEO_Init();	
 	rmode = VIDEO_GetPreferredMode(NULL);
-	xfb = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
-	VIDEO_Configure(rmode);
-	VIDEO_SetNextFramebuffer(xfb);
+	xfb = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));	
+	VIDEO_Configure(rmode);	
+	VIDEO_SetNextFramebuffer(xfb);	
 	VIDEO_SetBlack(TRUE);
 	VIDEO_Flush();
 	VIDEO_WaitVSync();
@@ -142,8 +302,21 @@ int main(int argc, char *argv[])
 	}
 	fclose(exeFile);
 
+	if (IsDollZ(exeBuffer) == false) 
+	{
+		arg_init();
+		arg_add(filepath); // argv[0] = filepath
+		// load meta.xml
+		load_meta(filepath);
+		// parse <arguments> in meta.xml
+		parse_meta();
+	}
+
 	memcpy(BOOTER_ADDR, app_booter_bin, app_booter_bin_size);
 	DCFlushRange(BOOTER_ADDR, app_booter_bin_size);
+
+	memcpy(ARGS_ADDR, &args, sizeof(args));
+	DCFlushRange(ARGS_ADDR, sizeof(args) + args.length);
 
 	SDCard_deInit();
 	USBDevice_deInit();
